@@ -101,8 +101,17 @@ static cregex_node_t *parse_char_class(regex_parse_context *context)
  * cregex_compile.c's count_instructions() (which multiplies nmin/nmax by
  * the quantified sub-pattern's instruction count to size the compiled
  * program buffer) can't itself overflow into an undersized allocation.
+ *
+ * This also bounds recursion depth: a large {n,m} is compiled into a
+ * chain of that many SPLIT instructions, and the VM's vm_add_thread()
+ * walks that chain *recursively* while building the initial epsilon
+ * closure (once per cregex_program_run() call, not just once per
+ * compile). A 65535 cap was still large enough to blow a default-size
+ * thread stack (confirmed via fuzzing: "a*{,61056}" stack-overflows under
+ * ASan at ~61k recursive calls); 1000 leaves a wide safety margin even on
+ * the smaller (~1MB) stacks Windows GUI worker threads typically get.
  */
-#define REGEX_INTERVAL_MAX 65535
+#define REGEX_INTERVAL_MAX 1000
 
 static cregex_node_t *parse_interval(regex_parse_context *context)
 {
