@@ -8,6 +8,37 @@ typedef struct {
     int ncaptures;
 } regex_compile_context;
 
+/* Upper bound on the number of instructions a compiled program may have.
+ * parse_interval() caps each individual {n,m} at REGEX_INTERVAL_MAX, but
+ * quantifying a quantifier (e.g. "a{9999}{9999}") is accepted by this
+ * grammar and *multiplies* instruction counts per nesting level rather
+ * than adding them, so a handful of chained/nested intervals can still
+ * blow past any reasonable memory budget (and, prior to the saturating
+ * arithmetic below, past INT_MAX itself). count_instructions() saturates
+ * at REGEX_PROGRAM_MAX_INSTRUCTIONS + 1 instead of overflowing signed
+ * int, and cregex_compile_node() refuses to allocate/compile anything at
+ * or above the cap.
+ */
+#define REGEX_PROGRAM_MAX_INSTRUCTIONS 1000000
+
+static int saturating_add(int a, int b)
+{
+    if (a > REGEX_PROGRAM_MAX_INSTRUCTIONS || b > REGEX_PROGRAM_MAX_INSTRUCTIONS ||
+        a > REGEX_PROGRAM_MAX_INSTRUCTIONS - b)
+        return REGEX_PROGRAM_MAX_INSTRUCTIONS + 1;
+    return a + b;
+}
+
+static int saturating_mul(int a, int b)
+{
+    if (a == 0 || b == 0)
+        return 0;
+    if (a > REGEX_PROGRAM_MAX_INSTRUCTIONS || b > REGEX_PROGRAM_MAX_INSTRUCTIONS ||
+        a > REGEX_PROGRAM_MAX_INSTRUCTIONS / b)
+        return REGEX_PROGRAM_MAX_INSTRUCTIONS + 1;
+    return a * b;
+}
+
 static int count_instructions(const cregex_node_t *node)
 {
     switch (node->type) {
@@ -23,17 +54,19 @@ static int count_instructions(const cregex_node_t *node)
 
     /* Composites */
     case REGEX_NODE_TYPE_CONCATENATION:
-        return count_instructions(node->left) + count_instructions(node->right);
+        return saturating_add(count_instructions(node->left),
+                              count_instructions(node->right));
     case REGEX_NODE_TYPE_ALTERNATION:
-        return 2 + count_instructions(node->left) +
-               count_instructions(node->right);
+        return saturating_add(2, saturating_add(count_instructions(node->left),
+                                                count_instructions(node->right)));
 
     /* Quantifiers */
     case REGEX_NODE_TYPE_QUANTIFIER: {
         int num = count_instructions(node->quantified);
         if (node->nmax >= node->nmin)
-            return node->nmin * num + (node->nmax - node->nmin) * (num + 1);
-        return 1 + (node->nmin ? node->nmin * num : num + 1);
+            return saturating_add(saturating_mul(node->nmin, num),
+                                  saturating_mul(node->nmax - node->nmin, num + 1));
+        return saturating_add(1, node->nmin ? saturating_mul(node->nmin, num) : num + 1);
     }
 
     /* Anchors */
@@ -43,7 +76,7 @@ static int count_instructions(const cregex_node_t *node)
 
     /* Captures */
     case REGEX_NODE_TYPE_CAPTURE:
-        return 2 + count_instructions(node->captured);
+        return saturating_add(2, count_instructions(node->captured));
     }
 
     /* should not reach here */
@@ -307,9 +340,18 @@ static int estimate_instructions(const cregex_node_t *root)
 
 cregex_program_t *cregex_compile_node(const cregex_node_t *root)
 {
-    size_t size = sizeof(cregex_program_t) +
-                  sizeof(cregex_program_instr_t) * estimate_instructions(root);
+    int ninstructions = estimate_instructions(root);
     cregex_program_t *program;
+
+    /* Refuse to compile (and allocate) patterns whose instruction count
+     * hit the saturating cap in count_instructions() -- e.g. chained
+     * quantifiers like "a{9999}{9999}{9999}" -- instead of attempting a
+     * multi-GB allocation. */
+    if (ninstructions > REGEX_PROGRAM_MAX_INSTRUCTIONS)
+        return NULL;
+
+    size_t size = sizeof(cregex_program_t) +
+                  sizeof(cregex_program_instr_t) * ninstructions;
 
     if (!(program = malloc(size)))
         return NULL;
