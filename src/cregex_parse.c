@@ -95,13 +95,30 @@ static cregex_node_t *parse_char_class(regex_parse_context *context)
     }
 }
 
+/* Upper bound for {n,m} repeat counts. Keeps digit accumulation below
+ * INT_MAX (avoiding signed integer overflow / UB while parsing) and keeps
+ * nmin/nmax small enough that later arithmetic on them in
+ * cregex_compile.c's count_instructions() (which multiplies nmin/nmax by
+ * the quantified sub-pattern's instruction count to size the compiled
+ * program buffer) can't itself overflow into an undersized allocation.
+ */
+#define REGEX_INTERVAL_MAX 65535
+
 static cregex_node_t *parse_interval(regex_parse_context *context)
 {
     const char *from = context->sp;
     int nmin, nmax;
+    int overflow = 0;
 
-    for (nmin = 0; *context->sp >= '0' && *context->sp <= '9'; ++context->sp)
-        nmin = (nmin * 10) + (*context->sp - '0');
+    for (nmin = 0; *context->sp >= '0' && *context->sp <= '9'; ++context->sp) {
+        /* Once we've exceeded the cap, stop doing arithmetic on nmin (it's
+         * already rejected below) so repeated *10 can't itself overflow
+         * signed int; just keep consuming digit characters. */
+        if (!overflow) {
+            nmin = (nmin * 10) + (*context->sp - '0');
+            overflow = (nmin > REGEX_INTERVAL_MAX);
+        }
+    }
 
     if (*context->sp == ',') {
         ++context->sp;
@@ -109,10 +126,14 @@ static cregex_node_t *parse_interval(regex_parse_context *context)
             nmax = -1;
         else {
             for (nmax = 0; *context->sp >= '0' && *context->sp <= '9';
-                 ++context->sp)
-                nmax = (nmax * 10) + (*context->sp - '0');
+                 ++context->sp) {
+                if (!overflow) {
+                    nmax = (nmax * 10) + (*context->sp - '0');
+                    overflow = (nmax > REGEX_INTERVAL_MAX);
+                }
+            }
             if (*(context->sp - 1) == ',' || *context->sp != '}' ||
-                nmax < nmin) {
+                nmax < nmin || overflow) {
                 context->sp = from;
                 return NULL;
             }
@@ -120,6 +141,11 @@ static cregex_node_t *parse_interval(regex_parse_context *context)
     } else if (*from != '}' && *context->sp == '}') {
         nmax = nmin;
     } else {
+        context->sp = from;
+        return NULL;
+    }
+
+    if (overflow) {
         context->sp = from;
         return NULL;
     }
