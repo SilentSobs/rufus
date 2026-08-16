@@ -72,11 +72,20 @@ static cregex_node_t *parse_char_class(regex_parse_context *context)
                             .type = type, .from = from, .to = context->sp - 1});
         case '\\':
             ch = *context->sp++;
+            if (ch == '\0')
+                /* premature end of character class (dangling escape) */
+                return NULL;
             /* fall-through */
         default:
         CHARACTER:
             if (*context->sp == '-' && context->sp[1] != ']') {
-                if (context->sp[1] < ch)
+                /* Compare as unsigned char: ch/sp[1] may be plain (signed)
+                 * char values sign-extended to negative ints for bytes
+                 * >= 0x80, which would make this "empty range" check pass
+                 * for a bogus range (e.g. the string's own NUL terminator
+                 * appearing to be "greater than" a negative ch), letting
+                 * sp advance past the end of the pattern buffer. */
+                if ((unsigned char)context->sp[1] < (unsigned char)ch)
                     /* empty range in character class */
                     return NULL;
                 context->sp += 2;
