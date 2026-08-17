@@ -34,14 +34,32 @@ typedef struct {
     vm_thread *threads;
 } vm_thread_list;
 
+/* vm_add_thread() recurses once per epsilon transition (SPLIT/JUMP/
+ * assertion/SAVE) it walks through between two consecutive "real"
+ * character-consuming instructions. A long run of these with nothing in
+ * between to terminate the descent early -- e.g. a quantified *empty*
+ * sub-pattern such as "(){555}{55}" -- can drive recursion depth close to
+ * the total instruction count of the compiled program, which is enough to
+ * blow the call stack well before REGEX_PROGRAM_MAX_INSTRUCTIONS is ever
+ * reached (confirmed via fuzzing: ASan stack-overflow). Cap the depth and
+ * simply stop exploring that path once hit, rather than adding the
+ * thread -- equivalent to the pattern failing to match along that
+ * particular (pathological) branch, not a crash.
+ */
+#define REGEX_VM_MAX_RECURSION_DEPTH 5000
+
 static void vm_add_thread(vm_thread_list *list,
                           const cregex_program_t *program,
                           const cregex_program_instr_t *pc,
                           const char *string,
                           const char *sp,
                           const char **matches,
-                          int nmatches)
+                          int nmatches,
+                          int depth)
 {
+    if (depth > REGEX_VM_MAX_RECURSION_DEPTH)
+        return;
+
     if (list->threads[pc - program->instructions].visited == sp - string + 1)
         return;
     list->threads[pc - program->instructions].visited = (int)(sp - string + 1);
@@ -65,21 +83,21 @@ static void vm_add_thread(vm_thread_list *list,
 
     /* Control-flow */
     case REGEX_PROGRAM_OPCODE_SPLIT:
-        vm_add_thread(list, program, pc->first, string, sp, matches, nmatches);
-        vm_add_thread(list, program, pc->second, string, sp, matches, nmatches);
+        vm_add_thread(list, program, pc->first, string, sp, matches, nmatches, depth + 1);
+        vm_add_thread(list, program, pc->second, string, sp, matches, nmatches, depth + 1);
         break;
     case REGEX_PROGRAM_OPCODE_JUMP:
-        vm_add_thread(list, program, pc->target, string, sp, matches, nmatches);
+        vm_add_thread(list, program, pc->target, string, sp, matches, nmatches, depth + 1);
         break;
 
     /* Assertions */
     case REGEX_PROGRAM_OPCODE_ASSERT_BEGIN:
         if (sp == string)
-            vm_add_thread(list, program, pc + 1, string, sp, matches, nmatches);
+            vm_add_thread(list, program, pc + 1, string, sp, matches, nmatches, depth + 1);
         break;
     case REGEX_PROGRAM_OPCODE_ASSERT_END:
         if (!*sp)
-            vm_add_thread(list, program, pc + 1, string, sp, matches, nmatches);
+            vm_add_thread(list, program, pc + 1, string, sp, matches, nmatches, depth + 1);
         break;
 
     /* Saving */
@@ -87,10 +105,10 @@ static void vm_add_thread(vm_thread_list *list,
         if (pc->save < nmatches && pc->save < REGEX_VM_MAX_MATCHES) {
             const char *saved = matches[pc->save];
             matches[pc->save] = sp;
-            vm_add_thread(list, program, pc + 1, string, sp, matches, nmatches);
+            vm_add_thread(list, program, pc + 1, string, sp, matches, nmatches, depth + 1);
             matches[pc->save] = saved;
         } else {
-            vm_add_thread(list, program, pc + 1, string, sp, matches, nmatches);
+            vm_add_thread(list, program, pc + 1, string, sp, matches, nmatches, depth + 1);
         }
         break;
     }
@@ -135,7 +153,7 @@ static int vm_run_with_threads(const cregex_program_t *program,
     memset(threads, 0, sizeof(vm_thread) * program->ninstructions * 2);
 
     vm_add_thread(current, program, program->instructions, string, string,
-                  matches, nmatches);
+                  matches, nmatches, 0);
 
     for (const char *sp = string;; ++sp) {
         for (int i = 0; i < current->nthreads; ++i) {
@@ -192,7 +210,7 @@ static int vm_run_with_threads(const cregex_program_t *program,
             }
 
             vm_add_thread(next, program, thread->pc + 1, string, sp + 1,
-                          thread->matches, nmatches);
+                          thread->matches, nmatches, 0);
         }
 
         /* swap current and next thread list */
