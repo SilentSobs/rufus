@@ -144,6 +144,10 @@ static cregex_node_t *parse_context(regex_parse_context *context, int depth)
         /* Characters */
         case '\\':
             ch = *context->sp++;
+            if (ch == '\0')
+                /* dangling escape at end of pattern: don't let a later
+                 * iteration read past the NUL terminator we just consumed */
+                return NULL;
             /* fall-through */
         default:
         CHARACTER:
