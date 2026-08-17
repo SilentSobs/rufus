@@ -160,11 +160,18 @@ static int vm_run_with_threads(const cregex_program_t *program,
                     break;
                 continue;
             case REGEX_PROGRAM_OPCODE_CHARACTER_CLASS:
-                if (cregex_char_class_contains(thread->pc->klass, *sp))
+                if (*sp && cregex_char_class_contains(thread->pc->klass, *sp))
                     break;
                 continue;
             case REGEX_PROGRAM_OPCODE_CHARACTER_CLASS_NEGATED:
-                if (!cregex_char_class_contains(thread->pc->klass, *sp))
+                /* The NUL terminator is never a "real" character to match,
+                 * even for a negated class (which would otherwise treat it
+                 * as "not in the class" and match it) -- doing so would let
+                 * sp advance one past the end of the string on the next
+                 * vm_add_thread(next, ..., sp + 1, ...) call below, and
+                 * potentially keep walking further out of bounds on
+                 * subsequent iterations. */
+                if (*sp && !cregex_char_class_contains(thread->pc->klass, *sp))
                     break;
                 continue;
 
